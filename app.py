@@ -17,7 +17,7 @@ prices_collection = db.prices
 emergent_key = os.environ.get("EMERGENT_API_KEY")
 ai_client = AsyncOpenAI(
     api_key=emergent_key,
-    base_url="https://api.anthropic.com/v1/" # Standard Anthropic endpoint
+    base_url="https://api.emergent.sh/v1" # Standard Anthropic endpoint
 )
 
 # --- 1. LOAD THE PRICE LIST ---
@@ -153,7 +153,7 @@ Here is your exact price list to match vehicles against:
 
     # Call the AI
     response = await ai_client.chat.completions.create(
-        model="claude-sonnet-5-5", # Updated to the correct Emergent model name
+        model="claude-sonnet-4-6", # Updated to the correct Emergent model name
         messages=messages
     )
     
