@@ -153,7 +153,7 @@ Here is your exact price list to match vehicles against:
 
     # Call the AI
     response = await ai_client.chat.completions.create(
-        model="claude-sonnet-5.5", # Assuming this is the Emergent model name
+        model="model="claude-sonnet-4-6", # Assuming this is the Emergent model name
         messages=messages
     )
     
