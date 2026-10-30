@@ -13,17 +13,16 @@ client = AsyncIOMotorClient(mongo_url)
 db = client.tintlife
 prices_collection = db.prices
 
-# Connect to Emergent/Claude
-emergent_key = os.environ.get("EMERGENT_API_KEY")
+# Connect to Groq (Free, no card)
+groq_key = os.environ.get("GROQ_API_KEY")
 ai_client = AsyncOpenAI(
-    api_key=emergent_key,
-    base_url="https://api.emergent.sh/v1" # Standard Anthropic endpoint
+    api_key=groq_key,
+    base_url="https://api.groq.com/openai/v1"
 )
 
 # --- 1. LOAD THE PRICE LIST ---
 @app.on_event("startup")
 async def load_prices():
-    # Check if we already loaded them
     count = await prices_collection.count_documents({})
     if count == 0:
         prices = [
@@ -78,12 +77,10 @@ async def simulator_ui():
             <input type="text" id="user-input" placeholder="Type as the customer..." onkeypress="handleKeyPress(event)">
             <button onclick="sendMessage()">Send</button>
         </div>
-
         <script>
             let history = [];
             const chatBox = document.getElementById('chat-box');
             const userInput = document.getElementById('user-input');
-
             function addMessage(text, sender) {
                 const div = document.createElement('div');
                 div.className = 'message ' + sender;
@@ -91,24 +88,19 @@ async def simulator_ui():
                 chatBox.appendChild(div);
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
-
             function handleKeyPress(e) {
                 if (e.key === 'Enter') sendMessage();
             }
-
             async function sendMessage() {
                 const text = userInput.value.trim();
                 if (!text) return;
-                
                 addMessage(text, 'user');
                 userInput.value = '';
-                
                 const response = await fetch('/chat', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ message: text, history: history })
                 });
-                
                 const data = await response.json();
                 addMessage(data.reply, 'sam');
                 history = data.updated_history;
@@ -126,7 +118,6 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    # Get current prices for context
     prices_cursor = prices_collection.find({})
     prices_list = await prices_cursor.to_list(length=100)
     price_text = "\n".join([f"- {p['service']}: ${p['price']}" for p in prices_list])
@@ -151,9 +142,9 @@ Here is your exact price list to match vehicles against:
         messages.append(msg)
     messages.append({"role": "user", "content": request.message})
 
-    # Call the AI
+    # Call Groq (free model)
     response = await ai_client.chat.completions.create(
-        model="claude-sonnet-4-6", # Updated to the correct Emergent model name
+        model="llama-3.3-70b-versatile", # Free model on Groq
         messages=messages
     )
     
