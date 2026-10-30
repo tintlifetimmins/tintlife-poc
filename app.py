@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
+from datetime import datetime, timezone
 import os
 
 app = FastAPI()
@@ -12,6 +13,9 @@ mongo_url = os.environ.get("MONGO_URI")
 client = AsyncIOMotorClient(mongo_url)
 db = client.tintlife
 prices_collection = db.prices
+
+# Rules the owner teaches via *change, - kept out of the price data on purpose
+rules_collection = db.custom_rules
 
 # Connect to Groq (Free, no card)
 groq_key = os.environ.get("GROQ_API_KEY")
@@ -142,6 +146,25 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    text = request.message.strip()
+    lowered = text.lower()
+
+    # *change, <rule> - saved to custom_rules, never forwarded to the model
+    if lowered.startswith("*change,"):
+        new_rule = text[len("*change,"):].strip()
+        if not new_rule:
+            return {"reply": "What's the rule?", "updated_history": request.history}
+        await rules_collection.insert_one({
+            "rule": new_rule,
+            "created_at": datetime.now(timezone.utc)
+        })
+        return {"reply": "Got it. Rule added.", "updated_history": request.history}
+
+    # *clear - wipes every custom rule
+    if lowered == "*clear":
+        await rules_collection.delete_many({})
+        return {"reply": "Rules cleared.", "updated_history": request.history}
+
     prices_cursor = prices_collection.find({})
     prices_list = await prices_cursor.to_list(length=100)
     price_text = "\n".join([f"- {p['service']}: ${p['price']}" for p in prices_list])
@@ -180,6 +203,15 @@ His price list, to match vehicles against:
 
 Last thing: before you type anything about timing, booking or "still good for", check whether they actually asked for a service or a price yet. If they didn't, don't. Ask what they need instead.
 """
+
+    custom_rules = await rules_collection.find({}).sort([("created_at", 1), ("_id", 1)]).to_list(length=200)
+    if custom_rules:
+        rules_block = "\n".join(f"- {doc['rule']}" for doc in custom_rules)
+        system_prompt += (
+            "\n\nCRITICAL NEW RULES:\n"
+            "The owner added these live. They override anything above that conflicts with them.\n"
+            f"{rules_block}"
+        )
 
     messages = [{"role": "system", "content": system_prompt}]
     for msg in request.history:
