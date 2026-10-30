@@ -4,7 +4,9 @@ from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
 from datetime import datetime, timezone
+import json
 import os
+import re
 
 app = FastAPI()
 
@@ -23,6 +25,122 @@ ai_client = AsyncOpenAI(
     api_key=groq_key,
     base_url="https://api.groq.com/openai/v1"
 )
+
+# --- PRICE TOOL: the only way Sam is allowed to produce a number ---
+PRICE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_price",
+        "description": (
+            "Look up one exact price from the Tintlife price list. Use this for every quote - "
+            "never work the number out yourself and never add up individual windows for a full tint."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "vehicle_type": {
+                    "type": "string",
+                    "description": (
+                        "One of: sedan, coupe, small_suv, medium_suv, large_suv, pickup_4door, "
+                        "pickup_2door, minivan. If the customer only says SUV, ask which size first."
+                    )
+                },
+                "service": {
+                    "type": "string",
+                    "description": (
+                        "One of: full_tint, front_two, windshield_strip, sunroof, back_glass, "
+                        "one_door, tint_removal_door, tint_removal_rear."
+                    )
+                }
+            },
+            "required": ["vehicle_type", "service"]
+        }
+    }
+}
+
+# (service, vehicle_type) -> the exact "service" label stored in MongoDB
+PRICE_MAP = {
+    "full_tint": {
+        "sedan": "Full 4 door Sedan",
+        "4_door_sedan": "Full 4 door Sedan",
+        "coupe": "Full 2 door Coupe",
+        "2_door_coupe": "Full 2 door Coupe",
+        "small_suv": "Full small SUV",
+        "suv_small": "Full small SUV",
+        "suv": "Full medium SUV",
+        "medium_suv": "Full medium SUV",
+        "suv_medium": "Full medium SUV",
+        "large_suv": "Full large SUV",
+        "suv_large": "Full large SUV",
+        "pickup_4door": "Full 4 door pickup",
+        "pickup": "Full 4 door pickup",
+        "truck": "Full 4 door pickup",
+        "4_door_pickup": "Full 4 door pickup",
+        "pickup_2door": "Full 2 door pickup",
+        "2_door_pickup": "Full 2 door pickup",
+        "minivan": "Full minivan",
+        "van": "Full minivan"
+    },
+    "front_two": {
+        "coupe": "Front 2 windows coupe",
+        "2_door": "Front 2 windows coupe",
+        "default": "Front 2 windows standard"
+    },
+    "windshield_strip": {"default": "Windshield strip"},
+    "sunroof": {
+        "single": "Sunroof single pane",
+        "panoramic": "Sunroof panoramic/double",
+        "double": "Sunroof panoramic/double",
+        "default": "Sunroof single pane"
+    },
+    "back_glass": {
+        "truck": "Back glass only truck",
+        "pickup": "Back glass only truck",
+        "pickup_4door": "Back glass only truck",
+        "pickup_2door": "Back glass only truck",
+        "default": "Back glass only other"
+    },
+    "one_door": {"default": "One door glass"},
+    "tint_removal_door": {"default": "Tint removal per door"},
+    "tint_removal_rear": {"default": "Tint removal rear window"}
+}
+
+
+def _slug(value):
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
+
+
+def _match(table, vehicle_type, service=""):
+    if vehicle_type and vehicle_type in table:
+        return table[vehicle_type]
+    if service and service in table:
+        return table[service]
+    haystack = f"{vehicle_type} {service}"
+    for key, label in table.items():
+        if key != "default" and key in haystack:
+            return label
+    return table.get("default")
+
+
+async def get_price(vehicle_type, service):
+    """Return the exact price from MongoDB as a string. Never computes a total."""
+    vt, sv = _slug(vehicle_type), _slug(service)
+    table = PRICE_MAP.get(sv)
+    if table is None:
+        for key, candidate in PRICE_MAP.items():
+            if key in sv or sv in key:
+                table = candidate
+                break
+    if table is None:
+        return "unknown service"
+    label = _match(table, vt, sv)
+    if label is None:
+        return "unknown vehicle type"
+    doc = await prices_collection.find_one({"service": label})
+    if not doc:
+        return "price not found"
+    return str(doc["price"])
+
 
 # --- 1. LOAD THE PRICE LIST ---
 @app.on_event("startup")
@@ -165,42 +283,28 @@ async def chat(request: ChatRequest):
         await rules_collection.delete_many({})
         return {"reply": "Rules cleared.", "updated_history": request.history}
 
-    prices_cursor = prices_collection.find({})
-    prices_list = await prices_cursor.to_list(length=100)
-    price_text = "\n".join([f"- {p['service']}: ${p['price']}" for p in prices_list])
+    system_prompt = """IDENTITY:
+You are Sam, the booking assistant for Tintlife.
 
-    system_prompt = f"""PERSONA:
-You are Sam, Leigh's booking assistant at Tintlife. You are charismatic, laid-back, and friendly. You text like a real guy in his 30s who works at a tint shop. You have a sense of humor and actually care about the customer's car.
+PERSONALITY:
+You are a laid-back guy in his 30s working at a tint shop. You are deadpan, normal, and casual. You are NOT a cheerleader and NOT a customer service bot. You use natural filler words (yeah, yup, gotcha, cool). If they mention their car, just acknowledge it normally: "F-150? nice, what year". NEVER say "Sweet ride", "Awesome", or "That's sick".
 
-VARY YOUR PHRASING:
-Never repeat the exact same greeting or sentence structure twice in a row. You have a wide vocabulary. If you greeted someone with "hey whats up", use "yup what do you need" or "yo" next time. You are a human having a real conversation, not a machine reading a script. Shake up how you ask for things so it always feels fresh.
+CONVERSATION FLOW:
+1) If they ask for tint, ask what kind of vehicle they drive.
+2) Once you know the vehicle, ask for the year if they didn't say it.
+3) Quote the price (using your get_price tool).
+4) Ask if they want to book.
 
-EMOTION & CHARISMA:
-React to what the customer says. If they have a nice car, say "oh nice" or "those are sick". If they are frustrated, say "ah that sucks man". Mirror their energy. NEVER sound like a customer service bot. Do not use phrases like "I can help with that" or "please provide".
-
-GATHERING INFO:
-You need the year, make, model, and body style to quote. But DO NOT list this like a form. Ask naturally. If they say "I need a tint", say "cool, what are you driving?" Once they tell you the car, ask for the year if they didn't include it.
-
-EXAMPLES OF HOW YOU TALK:
-- Customer: "hey" -> Sam: "hey whats up man"
-- Customer: "need tint" -> Sam: "yeah no prob, what kind of vehicle you got?"
-- Customer: "2020 civic" -> Sam: "nice, sedan? full tint is 350 plus hst"
-- Customer: "I have a 2021 f150" -> Sam: "love those trucks. full tint on a 4 door pickup is 300 plus hst, comes with a free windshield strip"
-
-HARD BUSINESS RULES:
-- Never claim to be Leigh. If asked, say: "It's Sam, Tintlife's booking assistant. I can get Leigh for you if you need to speak with him."
-- All prices are PLUS HST.
-- Any full tint includes ONE free windshield strip. Mention it casually.
-- Windshield tint is OWNER ONLY. If asked, say "Leigh handles that personally" and stop.
-- Rear window removal: Warn them it can damage defroster lines.
-- Dealerships: If they sound like a dealership, say "I'll get Leigh to reach out."
-- No emojis. Keep replies short.
-- Never bring up scheduling, times or booking until the customer has actually asked for a service or a price.
-- PRICING LOGIC: A "Full Tint" ALREADY INCLUDES all doors, quarter glasses, and the rear glass. If a customer asks for a full tint and then says "just the doors and back glass", they are confirming what a full tint is. NEVER break down a full tint into individual door or back glass prices. ALWAYS use the flat Full Tint price for that vehicle type. Only use the "One door glass" or "Back glass only" prices if the customer explicitly says they ONLY want one window done, and are NOT getting the rest of the car tinted.
-- NEVER show your math or use bullet points when quoting. Just give the final price in one short, casual sentence.
-
-PRICE LIST - match the vehicle to the closest line:
-{price_text}
+HARD RULES:
+- No emojis. No exclamation marks. No asterisks for actions. All prices are plus HST.
+- NEVER calculate a price yourself. ALWAYS use the get_price tool to get the exact number. If a customer asks for a full tint, use the tool to get the full tint price, do NOT add up individual window prices.
+- A full tint already includes all doors, quarter glasses and the rear glass. If they say "just the doors and back glass", that is still one full tint price.
+- Any full tint includes one free windshield strip. Mention it casually.
+- Windshield tint means you say "Leigh handles that personally" and stop.
+- Rear window removal: warn it can damage defroster lines.
+- If they sound like a dealership, say "I'll get Leigh to reach out."
+- Never claim to be Leigh. If asked: "It's Sam, Tintlife's booking assistant. I can get Leigh for you if you need to speak with him."
+- If they just say hi, say hey back and ask what they need. No booking or times until they have asked for a service or a price.
 """
 
     custom_rules = await rules_collection.find({}).sort([("created_at", 1), ("_id", 1)]).to_list(length=200)
@@ -217,14 +321,35 @@ PRICE LIST - match the vehicle to the closest line:
         messages.append(msg)
     messages.append({"role": "user", "content": request.message})
 
-    # Call Groq (free model)
-    response = await ai_client.chat.completions.create(
-        model="openai/gpt-oss-120b", # Current stable Groq model
-        messages=messages
-    )
-    
-    reply = response.choices[0].message.content
-    
+    # Tool-use loop: Groq can ask for get_price, we run it and hand the result back
+    reply = None
+    for _ in range(3):
+        response = await ai_client.chat.completions.create(
+            model="openai/gpt-oss-120b", # Current stable Groq model
+            messages=messages,
+            tools=[PRICE_TOOL],
+            tool_choice="auto"
+        )
+        message = response.choices[0].message
+        if not getattr(message, "tool_calls", None):
+            reply = message.content
+            break
+        messages.append(message.model_dump(exclude_none=True))
+        for call in message.tool_calls:
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            price = await get_price(args.get("vehicle_type", ""), args.get("service", ""))
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": price
+            })
+
+    if reply is None:
+        reply = "one sec, let me check with Leigh"
+
     updated_history = request.history + [
         {"role": "user", "content": request.message},
         {"role": "assistant", "content": reply}
