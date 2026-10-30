@@ -60,6 +60,11 @@ async def simulator_ui():
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; display: flex; flex-direction: column; height: 90vh; }
             h1 { font-size: 20px; color: #fff; margin-bottom: 20px; text-align: center; }
+            .status { display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; letter-spacing: 0.3px; color: #b0b0b0; margin: -12px 0 14px; }
+            .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #34c759; box-shadow: 0 0 8px rgba(52, 199, 89, 0.55); transition: background 0.2s ease, box-shadow 0.2s ease; }
+            .status.typing .status-dot { background: #ffd60a; box-shadow: 0 0 8px rgba(255, 214, 10, 0.55); animation: status-pulse 1s ease-in-out infinite; }
+            .status.error .status-dot { background: #ff453a; box-shadow: 0 0 8px rgba(255, 69, 58, 0.55); }
+            @keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
             #chat-box { flex-grow: 1; border: 1px solid #333; border-radius: 8px; padding: 15px; overflow-y: scroll; background: #1e1e1e; margin-bottom: 15px; display: flex; flex-direction: column; gap: 10px; }
             .message { padding: 10px 14px; border-radius: 18px; max-width: 80%; line-height: 1.4; font-size: 15px; }
             .user { background: #0084ff; color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
@@ -72,6 +77,10 @@ async def simulator_ui():
     </head>
     <body>
         <h1>Tintlife Booking Agent Test</h1>
+        <div id="status" class="status online" role="status" aria-live="polite">
+            <span class="status-dot"></span>
+            <span id="status-text">Online</span>
+        </div>
         <div id="chat-box"></div>
         <div class="input-area">
             <input type="text" id="user-input" placeholder="Type as the customer..." onkeypress="handleKeyPress(event)">
@@ -81,6 +90,12 @@ async def simulator_ui():
             let history = [];
             const chatBox = document.getElementById('chat-box');
             const userInput = document.getElementById('user-input');
+            const statusEl = document.getElementById('status');
+            const statusText = document.getElementById('status-text');
+            function setStatus(state, text) {
+                statusEl.className = 'status ' + state;
+                statusText.textContent = text;
+            }
             function addMessage(text, sender) {
                 const div = document.createElement('div');
                 div.className = 'message ' + sender;
@@ -96,14 +111,23 @@ async def simulator_ui():
                 if (!text) return;
                 addMessage(text, 'user');
                 userInput.value = '';
-                const response = await fetch('/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ message: text, history: history })
-                });
-                const data = await response.json();
-                addMessage(data.reply, 'sam');
-                history = data.updated_history;
+                setStatus('typing', 'Sam is typing...');
+                try {
+                    const response = await fetch('/chat', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ message: text, history: history })
+                    });
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    const data = await response.json();
+                    addMessage(data.reply, 'sam');
+                    history = data.updated_history;
+                    setStatus('online', 'Online');
+                } catch (error) {
+                    console.error('Chat request failed:', error);
+                    addMessage("Sorry - I couldn't reach the booking agent. Please try again.", 'sam');
+                    setStatus('error', 'Error');
+                }
             }
         </script>
     </body>
