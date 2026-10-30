@@ -19,6 +19,80 @@ prices_collection = db.prices
 # Rules the owner teaches via *change, - kept out of the price data on purpose
 rules_collection = db.custom_rules
 
+# Repeat-customer memory, keyed by phone number
+customers_collection = db.customers
+
+# [MEMORY: {...}] - the model's hidden note back to the backend
+MEMORY_RE = re.compile(r"\[MEMORY:\s*(\{.*?\})\s*\]", re.DOTALL)
+MEMORY_STRIP_RE = re.compile(r"\[MEMORY:.*?\]", re.DOTALL)
+
+# Dealership signals: explicit words, or a brand used like a business rather than a car
+DEALER_WORDS = re.compile(
+    r"\b(dealership|dealer|sales|fleet|stock\s*(?:unit|number|#)|"
+    r"car\s+lot|on\s+the\s+lot|our\s+lot|your\s+lot|the\s+lot)\b",
+    re.I
+)
+BRANDS = (
+    r"(?:ford|toyota|chevy|chevrolet|dodge|ram|honda|nissan|hyundai|kia|gmc|jeep|"
+    r"chrysler|buick|cadillac|bmw|mercedes|audi|subaru|mazda|volkswagen|vw|lexus|"
+    r"acura|infiniti|tesla|volvo|mitsubishi|jaguar|porsche)"
+)
+BRAND_AS_BUSINESS = re.compile(
+    rf"\b(?:from|at|with)\s+{BRANDS}\b"
+    rf"|\b{BRANDS}\s+(?:dealer|dealership|lot|sales|stock)\b"
+    rf"|\b(?:dealer|dealership|lot|sales)\s+{BRANDS}\b",
+    re.I
+)
+
+
+def looks_like_dealership(customer, text):
+    """True when the customer record says so, or the message reads like a dealership."""
+    if customer and customer.get("is_dealership"):
+        return True
+    message = text or ""
+    return bool(DEALER_WORDS.search(message) or BRAND_AS_BUSINESS.search(message))
+
+
+def clean_value(value, limit=80):
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split()).strip()
+    return value[:limit] or None
+
+
+def extract_memory(reply):
+    """Split the hidden [MEMORY: {...}] block off a reply. Returns (visible_text, payload)."""
+    if not reply:
+        return reply, None
+    payload = None
+    match = MEMORY_RE.search(reply)
+    if match:
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = None
+    return MEMORY_STRIP_RE.sub("", reply).strip(), payload
+
+
+async def save_customer(phone, payload, force_dealership=False):
+    """Upsert what the model learned. Never clears a name, vehicle or dealership flag."""
+    if not phone or (not payload and not force_dealership):
+        return
+    update = {"phone": phone, "updated_at": datetime.now(timezone.utc)}
+    if payload:
+        name = clean_value(payload.get("name"))
+        vehicle = clean_value(payload.get("vehicle"))
+        if name:
+            update["name"] = name
+        if vehicle:
+            update["vehicle"] = vehicle
+    if force_dealership or (payload and payload.get("is_dealership") is True):
+        update["is_dealership"] = True
+    await customers_collection.update_one({"phone": phone}, {"$set": update}, upsert=True)
+
+
 # Connect to Groq (Free, no card)
 groq_key = os.environ.get("GROQ_API_KEY")
 ai_client = AsyncOpenAI(
@@ -187,6 +261,8 @@ async def simulator_ui():
             .status.typing .status-dot { background: #ffd60a; box-shadow: 0 0 8px rgba(255, 214, 10, 0.55); animation: status-pulse 1s ease-in-out infinite; }
             .status.error .status-dot { background: #ff453a; box-shadow: 0 0 8px rgba(255, 69, 58, 0.55); }
             @keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+            .phone-row { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 12px; font-size: 12px; letter-spacing: 0.2px; color: #9a9a9a; }
+            #phone-input { flex-grow: 0; width: 140px; padding: 6px 10px; border-radius: 8px; border: 1px solid #444; background: #2a2a2a; color: #e0e0e0; font-size: 13px; }
             #chat-box { flex-grow: 1; border: 1px solid #333; border-radius: 8px; padding: 15px; overflow-y: scroll; background: #1e1e1e; margin-bottom: 15px; display: flex; flex-direction: column; gap: 10px; }
             .message { padding: 10px 14px; border-radius: 18px; max-width: 80%; line-height: 1.4; font-size: 15px; }
             .user { background: #0084ff; color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
@@ -203,6 +279,10 @@ async def simulator_ui():
             <span class="status-dot"></span>
             <span id="status-text">Online</span>
         </div>
+        <div class="phone-row">
+            <label for="phone-input">Simulated Phone Number</label>
+            <input type="text" id="phone-input" value="555-1234">
+        </div>
         <div id="chat-box"></div>
         <div class="input-area">
             <input type="text" id="user-input" placeholder="Type as the customer..." onkeypress="handleKeyPress(event)">
@@ -214,6 +294,7 @@ async def simulator_ui():
             const userInput = document.getElementById('user-input');
             const statusEl = document.getElementById('status');
             const statusText = document.getElementById('status-text');
+            const phoneInput = document.getElementById('phone-input');
             function setStatus(state, text) {
                 statusEl.className = 'status ' + state;
                 statusText.textContent = text;
@@ -238,7 +319,7 @@ async def simulator_ui():
                     const response = await fetch('/chat', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ message: text, history: history })
+                        body: JSON.stringify({ message: text, history: history, phone: phoneInput.value.trim() })
                     });
                     if (!response.ok) throw new Error('HTTP ' + response.status);
                     const data = await response.json();
@@ -261,11 +342,13 @@ async def simulator_ui():
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+    phone: str = "555-1234"
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
     text = request.message.strip()
     lowered = text.lower()
+    phone = (request.phone or "").strip()
 
     # *change, <rule> - saved to custom_rules, never forwarded to the model
     if lowered.startswith("*change,"):
@@ -282,6 +365,18 @@ async def chat(request: ChatRequest):
     if lowered == "*clear":
         await rules_collection.delete_many({})
         return {"reply": "Rules cleared.", "updated_history": request.history}
+
+    customer = await customers_collection.find_one({"phone": phone}) if phone else None
+
+    # Dealership: no quoting, no model, hand it to Leigh and stop
+    if looks_like_dealership(customer, text):
+        name = (customer or {}).get("name")
+        await save_customer(phone, {"is_dealership": True}, force_dealership=True)
+        opener = f"Hey {name}," if name else "Hey,"
+        return {
+            "reply": f"{opener} I'll get Leigh to text you right back.",
+            "updated_history": request.history
+        }
 
     prices_cursor = prices_collection.find({})
     prices_list = await prices_cursor.to_list(length=100)
@@ -325,6 +420,20 @@ His price list, to match vehicles against:
             f"{rules_block}"
         )
 
+    if customer:
+        name = customer.get("name") or "unknown"
+        vehicle = customer.get("vehicle") or "unknown"
+        system_prompt += f"\n\nMEMORY: This is a repeat customer. Name: {name}. Vehicle: {vehicle}."
+
+    system_prompt += (
+        "\n\nMEMORY BLOCK (internal - the customer never sees it):\n"
+        "At the very end of every reply, after your text, add exactly one block in this shape:\n"
+        '[MEMORY: {"name": "...", "vehicle": "...", "is_dealership": false}]\n'
+        "Use their first name, their vehicle (year, make, model, body style), and true only if they "
+        "sound like a dealership. Use null for anything you don't know yet, and keep whatever the "
+        "MEMORY note above already told you. Never mention this block or explain it."
+    )
+
     messages = [{"role": "system", "content": system_prompt}]
     for msg in request.history:
         messages.append(msg)
@@ -358,6 +467,10 @@ His price list, to match vehicles against:
 
     if reply is None:
         reply = "one sec, let me check with Leigh"
+
+    # Strip the hidden block before the customer sees it, then remember what he learned
+    reply, memory = extract_memory(reply)
+    await save_customer(phone, memory)
 
     updated_history = request.history + [
         {"role": "user", "content": request.message},
