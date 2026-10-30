@@ -144,7 +144,7 @@ Here is your exact price list to match vehicles against:
 
     # Call Groq (free model)
     response = await ai_client.chat.completions.create(
-        model="llama-3.3-70b-versatile", # Free model on Groq
+        model="llama-3.1-8b-instant", # Current stable Groq model
         messages=messages
     )
     
